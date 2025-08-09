@@ -13,11 +13,66 @@ if (empty($_SESSION['token'])) {
 $actionMsg = '';
 $clientError = '';
 
-// Logging
-$LOG_FILE = __DIR__ . '/s3filemanager.log';
-function log_event($event, array $context = []) {
-    $line = date('c') . ' ' . $event . ' ' . json_encode($context) . PHP_EOL;
-    @file_put_contents($GLOBALS['LOG_FILE'], $line, FILE_APPEND | LOCK_EX);
+// Simple username/password auth (edit users as needed)
+$auth_users = [
+    'admin' => '$2y$10$/K.hjNr84lLNDt8fTXjoI.DBp6PpeyoJ.mGwrrLuCZfAwfSAGqhOW', // admin@123
+];
+
+$loginError = '';
+
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['type']) && isset($_POST['token']) && hash_equals($_SESSION['token'], $_POST['token'])) {
+    if ($_POST['type'] === 'login') {
+        $username = trim($_POST['username'] ?? '');
+        $password = (string)($_POST['password'] ?? '');
+        if ($username !== '' && isset($auth_users[$username]) && password_verify($password, $auth_users[$username])) {
+            session_regenerate_id(true);
+            $_SESSION['logged_in'] = true;
+            $_SESSION['username'] = $username;
+            header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+            exit;
+        } else {
+            $loginError = 'Invalid username or password.';
+        }
+    } elseif ($_POST['type'] === 'logout') {
+        unset($_SESSION['logged_in'], $_SESSION['username'], $_SESSION['s3']);
+        $actionMsg = 'You have been logged out.';
+    }
+}
+
+if (empty($_SESSION['logged_in'])) {
+    $tokenVal = htmlspecialchars($_SESSION['token'], ENT_QUOTES);
+    $loginMsgHtml = $actionMsg ? '<div class="message">' . htmlspecialchars($actionMsg) . '</div>' : '';
+    $loginErrHtml = $loginError ? '<div class="mt-4 p-3 bg-red-50 border-l-4 border-red-600 text-sm">' . htmlspecialchars($loginError) . '</div>' : '';
+    echo '<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Login - S3 File Manager</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-gray-100">
+  <div class="min-h-screen flex items-center justify-center">
+    <div class="bg-white rounded shadow p-6 w-full max-w-sm">
+      <h1 class="text-xl font-semibold mb-4">Sign in</h1>'
+      . $loginMsgHtml . $loginErrHtml .
+      '<form method="post" class="space-y-3">
+        <input type="hidden" name="token" value="' . $tokenVal . '">
+        <input type="hidden" name="type" value="login">
+        <div>
+          <label class="block text-sm font-medium">Username</label>
+          <input name="username" type="text" class="mt-1 w-full border rounded p-2" required>
+        </div>
+        <div>
+          <label class="block text-sm font-medium">Password</label>
+          <input name="password" type="password" class="mt-1 w-full border rounded p-2" required>
+        </div>
+        <button class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded" type="submit">Login</button>
+      </form>
+    </div>
+  </div>
+</body>
+</html>';
+    exit;
 }
 
 function s3_delete_prefix(S3Client $s3, string $bucket, string $prefix): void
@@ -62,7 +117,7 @@ function s3_rename_prefix(S3Client $s3, string $bucket, string $oldPrefix, strin
 }
 
 // Credentials form handling
-if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['type']) && isset($_POST['token']) && hash_equals($_SESSION['token'], $_POST['token'])) { log_event('post_creds', ['ip'=>$_SERVER['REMOTE_ADDR']??'', 'type'=>$_POST['type']]);
+if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['type']) && isset($_POST['token']) && hash_equals($_SESSION['token'], $_POST['token'])) {
     if ($_POST['type'] === 'creds') {
         $_SESSION['s3'] = [
             'key' => trim($_POST['aws_access_key_id'] ?? ''),
@@ -80,7 +135,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['type']) && isset($_PO
 
 // Build S3 client from session creds
 $s3 = null;
-if (!empty($_SESSION['s3']['key']) && !empty($_SESSION['s3']['secret']) && !empty($_SESSION['s3']['region'])) { log_event('build_client', ['region'=>$_SESSION['s3']['region']]);
+if (!empty($_SESSION['s3']['key']) && !empty($_SESSION['s3']['secret']) && !empty($_SESSION['s3']['region'])) {
     try {
         $cfg = [
         'credentials' => [
@@ -179,23 +234,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
                 }
                 $s3->createBucket($params);
                 $actionMsg = "Bucket created: $bucket";
-                log_event('create_bucket', ['bucket'=>$bucket, 'region'=>$_SESSION['s3']['region'] ?? null]);
             } elseif ($_POST['s3_action'] === 'delete-bucket' && !empty($bucket)) {
                 $s3->deleteBucket(['Bucket' => $bucket]);
                 $actionMsg = "Bucket deleted: $bucket";
-                log_event('delete_bucket', ['bucket'=>$bucket]);
             }
         } elseif ($action === 'delete-file') {
             $s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
             $actionMsg = "File deleted: $key";
-            log_event('delete_object', ['bucket'=>$bucket, 'key'=>$key]);
         } elseif ($action === 'create-folder') {
             $prefix = isset($_POST['prefix']) ? rtrim($_POST['prefix'], '/') : '';
             if ($prefix !== '') { $prefix .= '/'; }
             $folderName = $prefix . trim($_POST['folder_name'], '/') . '/';
             $s3->putObject(['Bucket' => $bucket, 'Key' => $folderName, 'Body' => '']);
             $actionMsg = "Folder created: $folderName";
-            log_event('create_folder', ['bucket'=>$bucket, 'folder'=>$folderName]);
         } elseif ($action === 'rename-object') {
             $newName = $_POST['new_name'];
             $s3->copyObject([
@@ -205,7 +256,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
             ]);
             $s3->deleteObject(['Bucket' => $bucket, 'Key' => $key]);
             $actionMsg = "Renamed to: $newName";
-            log_event('rename_object', ['bucket'=>$bucket, 'from'=>$key, 'to'=>$newName]);
         } elseif ($action === 'upload-object') {
             $prefix = isset($_POST['prefix']) ? rtrim($_POST['prefix'], '/') . '/' : '';
             if (isset($_FILES['file']) && $_FILES['file']['error'] === UPLOAD_ERR_OK) {
@@ -217,22 +267,19 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
                     'SourceFile' => $_FILES['file']['tmp_name']
                 ]);
                 $actionMsg = "Uploaded: $putKey";
-                log_event('upload_object', ['bucket'=>$bucket, 'key'=>$putKey]);
             } else {
                 $actionMsg = 'Upload failed.';
             }
         }
     } catch (AwsException $e) {
         $actionMsg = "Error: " . $e->getAwsErrorMessage();
-        log_event('aws_error', ['msg'=>$e->getAwsErrorMessage()]);
     } catch (Exception $e) {
         $actionMsg = "Error: " . $e->getMessage();
-        log_event('php_error', ['msg'=>$e->getMessage()]);
     }
 }
 
 // List buckets
-$buckets = $s3 ? $s3->listBuckets() : ['Buckets' => []]; log_event('list_buckets', ['ok'=> (bool)$s3]);
+$buckets = $s3 ? $s3->listBuckets() : ['Buckets' => []];
 $currentBucket = $_GET['bucket'] ?? '';
 $objects = [];
 if ($currentBucket && $s3) {
@@ -257,7 +304,17 @@ if ($currentBucket && $s3) {
 </head>
 <body>
 <header>
-    <h1><i class="fa-brands fa-aws"></i> AWS S3 File Manager</h1>
+    <div class="max-w-7xl mx-auto flex justify-between items-center">
+        <h1><i class="fa-brands fa-aws"></i> AWS S3 File Manager</h1>
+        <div class="flex items-center gap-3">
+            <span class="text-sm">Signed in as <?= htmlspecialchars($_SESSION['username'] ?? '') ?></span>
+            <form method="post">
+                <input type="hidden" name="token" value="<?= htmlspecialchars($_SESSION['token']) ?>">
+                <input type="hidden" name="type" value="logout">
+                <button class="border border-red-500 text-red-600 px-3 py-1 rounded text-sm" type="submit"><i class="fa fa-right-from-bracket"></i> Logout</button>
+            </form>
+        </div>
+    </div>
 </header>
 <div class="max-w-7xl mx-auto p-4">
     <?php if ($actionMsg): ?>
@@ -355,14 +412,15 @@ if ($currentBucket && $s3) {
             <div class="tree" id="tree"></div>
 <?php if ($currentBucket): ?>
 <div class="mt-3">
-                            <form class="inline" method="post">
-                                <input type="hidden" name="action" value="delete-file">
-                                <input type="hidden" name="bucket" value="<?= htmlspecialchars($currentBucket) ?>">
+    <form class="inline" method="post">
+        <input type="hidden" name="token" value="<?= htmlspecialchars($_SESSION['token']) ?>">
+        <input type="hidden" name="action" value="delete-file">
+        <input type="hidden" name="bucket" value="<?= htmlspecialchars($currentBucket) ?>">
         <input id="selectedKey" type="hidden" name="key" value="">
         <button type="submit" class="border border-red-500 text-red-600 px-2 py-1 rounded text-sm"><i class="fa fa-trash"></i> Delete Selected</button>
-                            </form>
+    </form>
 </div>
-    <?php endif; ?>
+<?php endif; ?>
         </div>
 </div>
 <script>
