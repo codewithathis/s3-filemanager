@@ -68,7 +68,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['type']) && isset($_PO
             'key' => trim($_POST['aws_access_key_id'] ?? ''),
             'secret' => trim($_POST['aws_secret_access_key'] ?? ''),
             'region' => trim($_POST['region'] ?? ''),
-            'endpoint' => trim($_POST['endpoint'] ?? ''),
+            'endpoint' => trim($_POST['endpoint'] ?? null),
             'path_style' => isset($_POST['use_path_style_endpoint']) ? true : false,
         ];
         $actionMsg = 'S3 credentials saved.';
@@ -439,6 +439,9 @@ function setCurrentPrefix(prefix){
 }
 // Hook: when a folder label is clicked and expanded, set prefix
 // We piggyback inside renderNode where folders are toggled
+
+// init
+loadRoot();
 </script>
 </body>
 </html>
