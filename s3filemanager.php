@@ -1,4 +1,5 @@
 <?php
+
 require 'vendor/autoload.php';
 
 use Aws\S3\S3Client;
@@ -538,7 +539,7 @@ if ($currentBucket && $s3) {
 <body>
 <header>
     <div class="max-w-7xl mx-auto flex justify-between items-center">
-        <h1><i class="fa-brands fa-aws"></i> AWS S3 File Manager</h1>
+        <h1><i class="fa-brands fa-aws"></i> S3 File Manager</h1>
         <div class="flex items-center gap-3">
             <span class="text-sm">Signed in as <?= htmlspecialchars($_SESSION['username'] ?? '') ?></span>
             <form method="post">
