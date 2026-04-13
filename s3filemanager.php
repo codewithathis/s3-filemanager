@@ -126,6 +126,129 @@ function s3_rename_prefix(S3Client $s3, string $bucket, string $oldPrefix, strin
     s3_delete_prefix($s3, $bucket, $oldPrefix);
 }
 
+/**
+ * Remove every object version and delete marker (versioned buckets on AWS).
+ */
+function s3_empty_bucket_via_versions(S3Client $s3, string $bucket): void
+{
+    $keyMarker = null;
+    $versionIdMarker = null;
+    $truncated = true;
+    while ($truncated) {
+        $params = ['Bucket' => $bucket];
+        if ($keyMarker !== null && $keyMarker !== '') {
+            $params['KeyMarker'] = $keyMarker;
+        }
+        if ($versionIdMarker !== null && $versionIdMarker !== '') {
+            $params['VersionIdMarker'] = $versionIdMarker;
+        }
+        $result = $s3->listObjectVersions($params);
+        $objects = [];
+        foreach ($result['Versions'] ?? [] as $version) {
+            $objects[] = ['Key' => $version['Key'], 'VersionId' => $version['VersionId']];
+        }
+        foreach ($result['DeleteMarkers'] ?? [] as $marker) {
+            $objects[] = ['Key' => $marker['Key'], 'VersionId' => $marker['VersionId']];
+        }
+        if ($objects !== []) {
+            foreach (array_chunk($objects, 1000) as $chunk) {
+                $s3->deleteObjects([
+                    'Bucket' => $bucket,
+                    'Delete' => ['Objects' => $chunk, 'Quiet' => true],
+                ]);
+            }
+        }
+        $truncated = !empty($result['IsTruncated']);
+        $keyMarker = $truncated ? ($result['NextKeyMarker'] ?? null) : null;
+        $versionIdMarker = $truncated ? ($result['NextVersionIdMarker'] ?? null) : null;
+    }
+}
+
+/**
+ * Delete current object listings only (fallback when ListObjectVersions is unavailable).
+ */
+function s3_empty_bucket_via_list_v2(S3Client $s3, string $bucket): void
+{
+    $token = null;
+    do {
+        $args = ['Bucket' => $bucket, 'MaxKeys' => 1000];
+        if ($token) {
+            $args['ContinuationToken'] = $token;
+        }
+        $res = $s3->listObjectsV2($args);
+        $keys = [];
+        foreach (($res['Contents'] ?? []) as $obj) {
+            $keys[] = ['Key' => $obj['Key']];
+        }
+        if ($keys !== []) {
+            foreach (array_chunk($keys, 1000) as $chunk) {
+                $s3->deleteObjects([
+                    'Bucket' => $bucket,
+                    'Delete' => ['Objects' => $chunk, 'Quiet' => true],
+                ]);
+            }
+        }
+        $token = !empty($res['IsTruncated']) ? ($res['NextContinuationToken'] ?? null) : null;
+    } while ($token);
+}
+
+function s3_abort_multipart_uploads(S3Client $s3, string $bucket): void
+{
+    try {
+        $keyMarker = null;
+        $uploadIdMarker = null;
+        $truncated = true;
+        while ($truncated) {
+            $params = ['Bucket' => $bucket];
+            if ($keyMarker !== null && $keyMarker !== '') {
+                $params['KeyMarker'] = $keyMarker;
+            }
+            if ($uploadIdMarker !== null && $uploadIdMarker !== '') {
+                $params['UploadIdMarker'] = $uploadIdMarker;
+            }
+            $res = $s3->listMultipartUploads($params);
+            foreach ($res['Uploads'] ?? [] as $up) {
+                $s3->abortMultipartUpload([
+                    'Bucket' => $bucket,
+                    'Key' => $up['Key'],
+                    'UploadId' => $up['UploadId'],
+                ]);
+            }
+            $truncated = !empty($res['IsTruncated']);
+            $keyMarker = $truncated ? ($res['NextKeyMarker'] ?? null) : null;
+            $uploadIdMarker = $truncated ? ($res['NextUploadIdMarker'] ?? null) : null;
+        }
+    } catch (AwsException $e) {
+        if ($e->getAwsErrorCode() === 'NotImplemented') {
+            return;
+        }
+        $msg = strtolower(trim(($e->getAwsErrorMessage() ?? '') . ' ' . $e->getMessage()));
+        if (str_contains($msg, 'not implemented')) {
+            return;
+        }
+        throw $e;
+    }
+}
+
+/**
+ * Empty bucket (all versions if supported), abort multipart uploads, then safe to deleteBucket on AWS.
+ */
+function s3_force_empty_bucket(S3Client $s3, string $bucket): void
+{
+    try {
+        s3_empty_bucket_via_versions($s3, $bucket);
+    } catch (AwsException $e) {
+        $code = $e->getAwsErrorCode();
+        $msg = strtolower(trim(($e->getAwsErrorMessage() ?? '') . ' ' . $e->getMessage()));
+        if ($code === 'NotImplemented' || str_contains($msg, 'not implemented')) {
+            s3_empty_bucket_via_list_v2($s3, $bucket);
+        } else {
+            throw $e;
+        }
+    }
+    s3_abort_multipart_uploads($s3, $bucket);
+}
+
 // Credentials form handling
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['type']) && isset($_POST['token']) && hash_equals($_SESSION['token'], $_POST['token'])) {
     if ($_POST['type'] === 'creds') {
@@ -186,6 +309,10 @@ if ($s3 && isset($_GET['download']) && isset($_GET['bucket']) && isset($_GET['ke
                 header($h . ': ' . $res['@metadata']['headers'][strtolower($h)]);
             }
         }
+        $dlName = basename(str_replace('\\', '/', $key));
+        $dlName = $dlName !== '' ? $dlName : 'download';
+        $ascii = preg_replace('/[^\x20-\x7E]/', '_', $dlName);
+        header('Content-Disposition: attachment; filename="' . str_replace(['\\', '"'], '_', $ascii) . '"; filename*=UTF-8\'\'' . rawurlencode($dlName));
         echo $res['Body'];
     } catch (Exception $e) {
         http_response_code(404);
@@ -296,13 +423,18 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
         if (isset($_POST['type']) && $_POST['type'] === 'bucket-action' && isset($_POST['s3_action'])) {
             if ($_POST['s3_action'] === 'create-bucket' && !empty($bucket)) {
                 $params = ['Bucket' => $bucket];
-                // If region differs from client region for providers like Hetzner, pass LocationConstraint
-                if (!empty($_SESSION['s3']['region'])) {
-                    $params['CreateBucketConfiguration'] = ['LocationConstraint' => $_SESSION['s3']['region']];
+                $region = trim((string) ($_SESSION['s3']['region'] ?? ''));
+                $endpoint = trim((string) ($_SESSION['s3']['endpoint'] ?? ''));
+                if ($region !== '') {
+                    $isAwsDefault = $endpoint === '' || str_contains($endpoint, 'amazonaws.com');
+                    if (!$isAwsDefault || strcasecmp($region, 'us-east-1') !== 0) {
+                        $params['CreateBucketConfiguration'] = ['LocationConstraint' => $region];
+                    }
                 }
                 $s3->createBucket($params);
                 $actionMsg = "Bucket created: $bucket";
             } elseif ($_POST['s3_action'] === 'delete-bucket' && !empty($bucket)) {
+                s3_force_empty_bucket($s3, $bucket);
                 $s3->deleteBucket(['Bucket' => $bucket]);
                 // Redirect to home after bucket deletion to avoid errors
                 header('Location: ' . $_SERVER['PHP_SELF'] . '?msg=' . urlencode("Bucket deleted: $bucket"));
@@ -427,8 +559,11 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
                     try {
                         if ($item['type'] === 'file') {
                             $oldKey = $item['key'];
-                            $newKey = $prefix . $item['name'] . $suffix;
-                            
+                            $dir = dirname(str_replace('\\', '/', $oldKey));
+                            $base = basename($oldKey);
+                            $newBase = $prefix . $base . $suffix;
+                            $newKey = ($dir === '.' || $dir === '') ? $newBase : $dir . '/' . $newBase;
+
                             // Copy to new location
                             $s3->copyObject([
                                 'Bucket' => $bucket,
@@ -457,7 +592,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
             }
         } elseif ($action === 'bulk-move') {
             $items = json_decode($_POST['items'] ?? '[]', true);
-            $targetFolder = $_POST['target_folder'] ?? '';
+            $tf = trim((string) ($_POST['target_folder'] ?? ''));
+            if ($tf !== '') {
+                $tf = rtrim(str_replace('\\', '/', $tf), '/') . '/';
+            }
             
             if (is_array($items) && !empty($items)) {
                 $movedCount = 0;
@@ -467,8 +605,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
                     try {
                         if ($item['type'] === 'file') {
                             $oldKey = $item['key'];
-                            $fileName = basename($oldKey);
-                            $newKey = $targetFolder . $fileName;
+                            $fileName = basename(str_replace('\\', '/', $oldKey));
+                            $newKey = $tf . $fileName;
                             
                             // Copy to new location
                             $s3->copyObject([
@@ -486,7 +624,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
                 }
                 
                 if ($movedCount > 0) {
-                    $actionMsg = "Successfully moved $movedCount item(s) to " . ($targetFolder ?: 'root');
+                    $actionMsg = "Successfully moved $movedCount item(s) to " . ($tf !== '' ? $tf : 'root');
                     if (!empty($errors)) {
                         $actionMsg .= ". Errors: " . implode('; ', $errors);
                     }
@@ -660,7 +798,7 @@ if ($currentBucket && $s3) {
                 <?php foreach ($buckets['Buckets'] as $bucket): ?>
                     <li class="py-2 flex justify-between items-center">
                         <a class="text-blue-700 flex items-center gap-2" href="?bucket=<?= urlencode($bucket['Name']) ?>"><i class="fa fa-database icon"></i> <span><?= htmlspecialchars($bucket['Name']) ?></span> <span id="size-<?= htmlspecialchars($bucket['Name']) ?>" class="text-xs text-gray-600"></span></a>
-                        <form class="inline" method="post" onsubmit="return confirm('Delete bucket?')">
+                        <form class="inline" method="post" onsubmit="return confirm('Delete this bucket? All objects (including all versions if versioning is on), delete markers, and incomplete multipart uploads will be removed first. This cannot be undone.')">
                             <input type="hidden" name="token" value="<?= htmlspecialchars($_SESSION['token']) ?>">
                             <input type="hidden" name="type" value="bucket-action">
                             <input type="hidden" name="s3_action" value="delete-bucket">

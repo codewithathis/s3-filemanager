@@ -40,12 +40,14 @@ Then open `http://localhost:8080/s3filemanager.php` in your browser.
 
 ## Features
 
-- List / create / delete buckets (empty bucket may be required before delete on AWS)
+- List / create / delete buckets  
+  - **Delete bucket** empties the bucket first: deletes all object versions and delete markers (when `ListObjectVersions` is supported), otherwise falls back to listing current keys; then **aborts incomplete multipart uploads**, then deletes the bucket.  
+  - **Create bucket** omits `LocationConstraint` for **us-east-1** on default AWS endpoints (required by AWS); other regions and custom endpoints still send the configured region.
 - Tree and folder views, lazy loading via `?tree=1`
 - Upload files, create folders, delete files and folders (prefix delete)
 - **Rename folder** (copy all objects under a prefix to a new prefix, then delete the old prefix)
-- Bulk delete, rename (prefix/suffix), move files
-- Download proxy (`?download=1`) and short-lived presigned GET URLs (`?presign=1`)
+- Bulk delete; **bulk rename** (prefix/suffix applies to the **file name only**, keeping parent folders); bulk move with normalized target folder paths
+- Download proxy (`?download=1`) with `Content-Disposition` filename, and short-lived presigned GET URLs (`?presign=1`)
 - Optional JSON bucket size: `?bucket_size=1&bucket=…`
 
 ## Security notes
