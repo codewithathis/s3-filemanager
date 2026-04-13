@@ -3,7 +3,6 @@ credentials.ini
 
 # Composer
 /vendor/
-composer.lock
 
 # IDE files
 .vscode/

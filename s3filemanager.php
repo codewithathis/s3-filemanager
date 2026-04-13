@@ -5,6 +5,15 @@ require 'vendor/autoload.php';
 use Aws\S3\S3Client;
 use Aws\Exception\AwsException;
 
+$secure = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off')
+    || ((int) ($_SERVER['SERVER_PORT'] ?? 0) === 443);
+session_set_cookie_params([
+    'lifetime' => 0,
+    'path' => '/',
+    'secure' => $secure,
+    'httponly' => true,
+    'samesite' => 'Lax',
+]);
 session_start();
 
 if (empty($_SESSION['token'])) {
@@ -14,9 +23,9 @@ if (empty($_SESSION['token'])) {
 $actionMsg = '';
 $clientError = '';
 
-// Simple username/password auth (edit users as needed)
+// Username => password_hash() hashes (see README to generate a new hash)
 $auth_users = [
-    'admin' => '$2y$10$/K.hjNr84lLNDt8fTXjoI.DBp6PpeyoJ.mGwrrLuCZfAwfSAGqhOW', // admin@123
+    'admin' => '$2y$10$/K.hjNr84lLNDt8fTXjoI.DBp6PpeyoJ.mGwrrLuCZfAwfSAGqhOW',
 ];
 
 $loginError = '';
@@ -120,18 +129,22 @@ function s3_rename_prefix(S3Client $s3, string $bucket, string $oldPrefix, strin
 // Credentials form handling
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['type']) && isset($_POST['token']) && hash_equals($_SESSION['token'], $_POST['token'])) {
     if ($_POST['type'] === 'creds') {
+        $incomingSecret = trim((string) ($_POST['aws_secret_access_key'] ?? ''));
+        $secret = $incomingSecret !== ''
+            ? $incomingSecret
+            : (string) ($_SESSION['s3']['secret'] ?? '');
         $_SESSION['s3'] = [
             'key' => trim($_POST['aws_access_key_id'] ?? ''),
-            'secret' => trim($_POST['aws_secret_access_key'] ?? ''),
+            'secret' => $secret,
             'region' => trim($_POST['region'] ?? ''),
-            'endpoint' => trim($_POST['endpoint'] ?? null),
-            'path_style' => isset($_POST['use_path_style_endpoint']) ? true : false,
+            'endpoint' => trim($_POST['endpoint'] ?? '') ?: null,
+            'path_style' => isset($_POST['use_path_style_endpoint']),
         ];
         $actionMsg = 'S3 credentials saved.';
     } elseif ($_POST['type'] === 'clear-creds') {
         unset($_SESSION['s3']);
         $actionMsg = 'S3 credentials cleared.';
-}
+    }
 }
 
 // Build S3 client from session creds
@@ -271,13 +284,15 @@ if (isset($_GET['tree']) && $s3) {
 }
 
 // Handle actions (delete, create, rename, etc.)
-$actionMsg = $actionMsg; // keep message from creds flow
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equals($_SESSION['token'], $_POST['token'])) {
     $action = $_POST['action'] ?? '';
     $bucket = $_POST['bucket'] ?? '';
     $key = $_POST['key'] ?? '';
 
     try {
+        if (!$s3) {
+            throw new RuntimeException('Save S3 credentials before running this action.');
+        }
         if (isset($_POST['type']) && $_POST['type'] === 'bucket-action' && isset($_POST['s3_action'])) {
             if ($_POST['s3_action'] === 'create-bucket' && !empty($bucket)) {
                 $params = ['Bucket' => $bucket];
@@ -308,6 +323,35 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['token']) && hash_equa
                 }
             } else {
                 $actionMsg = 'No folder path specified.';
+            }
+        } elseif ($action === 'rename-folder') {
+            $path = (string) ($_POST['path'] ?? '');
+            $newSegment = trim((string) ($_POST['new_name'] ?? ''), '/');
+            if ($path === '' || $newSegment === '') {
+                $actionMsg = 'Folder path and new name are required.';
+            } elseif (strpos($newSegment, '/') !== false) {
+                $actionMsg = 'New folder name cannot contain slashes.';
+            } else {
+                $oldPrefix = $path;
+                if (substr($oldPrefix, -1) !== '/') {
+                    $oldPrefix .= '/';
+                }
+                $trimmed = rtrim($oldPrefix, '/');
+                $parts = $trimmed === '' ? [] : explode('/', $trimmed);
+                $parts = array_values(array_filter($parts, static fn ($p) => $p !== ''));
+                if (empty($parts)) {
+                    $actionMsg = 'Invalid folder path.';
+                } else {
+                    array_pop($parts);
+                    $parent = empty($parts) ? '' : implode('/', $parts) . '/';
+                    $newPrefix = $parent . $newSegment . '/';
+                    if ($oldPrefix === $newPrefix) {
+                        $actionMsg = 'New name is the same as the current name.';
+                    } else {
+                        s3_rename_prefix($s3, $bucket, $oldPrefix, $newPrefix);
+                        $actionMsg = 'Folder renamed to: ' . $newPrefix;
+                    }
+                }
             }
         } elseif ($action === 'create-folder') {
             $prefix = isset($_POST['prefix']) ? rtrim($_POST['prefix'], '/') : '';
@@ -569,7 +613,7 @@ if ($currentBucket && $s3) {
             </div>
             <div class="md:col-span-2">
                 <label class="block text-sm font-medium">Secret Access Key</label>
-                <input type="text" name="aws_secret_access_key" class="mt-1 w-full border rounded p-2" value="<?= htmlspecialchars($_SESSION['s3']['secret'] ?? '') ?>" required>
+                <input type="password" name="aws_secret_access_key" class="mt-1 w-full border rounded p-2" value="" autocomplete="new-password" placeholder="<?= !empty($_SESSION['s3']['secret']) ? 'Leave blank to keep current secret' : 'Required' ?>" <?= empty($_SESSION['s3']['secret']) ? 'required' : '' ?>>
             </div>
             <div>
                 <label class="block text-sm font-medium">Region</label>
@@ -584,11 +628,15 @@ if ($currentBucket && $s3) {
                     <input type="checkbox" name="use_path_style_endpoint" class="mr-2" <?= !empty($_SESSION['s3']['path_style']) ? 'checked' : '' ?>> Path style
                 </label>
                 <button class="bg-green-600 hover:bg-green-700 text-white px-4 py-2 rounded" type="submit"><i class="fa fa-save"></i> Save</button>
-                <?php if (!empty($_SESSION['s3'])): ?>
-                <button class="border border-red-500 text-red-600 px-4 py-2 rounded" type="submit" formaction="" name="type" value="clear-creds"><i class="fa fa-unlock"></i> Clear</button>
-                <?php endif; ?>
             </div>
         </form>
+        <?php if (!empty($_SESSION['s3'])): ?>
+        <form method="post" class="mt-2 inline-flex">
+            <input type="hidden" name="token" value="<?= htmlspecialchars($_SESSION['token']) ?>">
+            <input type="hidden" name="type" value="clear-creds">
+            <button class="border border-red-500 text-red-600 px-4 py-2 rounded text-sm" type="submit"><i class="fa fa-unlock"></i> Clear saved credentials</button>
+        </form>
+        <?php endif; ?>
         <?php if ($clientError): ?>
             <div class="mt-4 p-3 bg-red-50 border-l-4 border-red-600 text-sm">Client error: <?= htmlspecialchars($clientError) ?></div>
         <?php endif; ?>
@@ -1092,12 +1140,40 @@ function openFolder(path) {
 }
 
 function renameFolder(path, name) {
-  const newName = prompt('Enter new folder name:', name.replace('/', ''));
-  if (newName && newName.trim()) {
-    // This would need backend implementation for folder renaming
-    alert('Folder renaming not yet implemented. This would rename all files in the folder.');
+  const def = (name || '').replace(/\//g, '');
+  const newName = prompt('Enter new folder name:', def);
+  if (newName === null) {
+    hideContextMenu();
+    return;
   }
-  hideContextMenu();
+  const trimmed = newName.trim();
+  if (!trimmed) {
+    hideContextMenu();
+    return;
+  }
+  if (trimmed.includes('/')) {
+    alert('Name cannot contain slashes.');
+    hideContextMenu();
+    return;
+  }
+  const form = document.createElement('form');
+  form.method = 'POST';
+  const fields = {
+    token: document.querySelector('input[name="token"]').value,
+    action: 'rename-folder',
+    bucket: currentBucket,
+    path: path,
+    new_name: trimmed,
+  };
+  Object.entries(fields).forEach(([k, v]) => {
+    const input = document.createElement('input');
+    input.type = 'hidden';
+    input.name = k;
+    input.value = v;
+    form.appendChild(input);
+  });
+  document.body.appendChild(form);
+  form.submit();
 }
 
 function deleteFolder(path) {

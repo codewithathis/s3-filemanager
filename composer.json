@@ -1,5 +1,13 @@
 {
+    "name": "athis/s3-filemanager",
+    "description": "Web UI for AWS S3 and S3-compatible object storage",
+    "type": "project",
+    "license": "MIT",
     "require": {
-        "aws/aws-sdk-php": "^3.352"
+        "php": "^8.1",
+        "aws/aws-sdk-php": "^3.360"
+    },
+    "config": {
+        "sort-packages": true
     }
 }
